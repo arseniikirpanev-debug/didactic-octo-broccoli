@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Amogus 2D Prototype</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: sans-serif;
+            width: 100%;
+            height: 100%;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            pointer-events: none;
+            font-size: 16px;
+            text-shadow: 1px 1px 2px black;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-layer">Ping: <span id="ping">0</span>ms</div>
+    <canvas id="gameCanvas"></canvas>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const socket = io();
+
+        // Local State Configuration
+        let myId = null;
+        let players = {};
+        const localPlayerSpeed = 300; 
+
+        // Canvas Sizing Adjustments
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Virtual Touch Joystick Properties
+        const joystick = {
+            active: false,
+            startX: 0,
+            startY: 0,
+            currentX: 0,
+            currentY: 0,
+            maxRadius: 60
+        };
+
+        // Network Performance metrics
+        let lastPingTime = Date.now();
+        setInterval(() => {
+            lastPingTime = Date.now();
+            socket.emit('ping_perf');
+        }, 2000);
+        socket.on('pong_perf', () => {
+            document.getElementById('ping').innerText = Date.now() - lastPingTime;
+        });
+        // Backwards compatibility fallback handle for tracking socket round-trips
+        socket.on('connect', () => {
+            socket.on('pong', () => {}); // placeholder mapping
+        });
+
+        // Socket Event Management
+        socket.on('init', (data) => {
+            myId = data.id;
+            players = data.players;
+        });
+
+        socket.on('playerJoined', (player) => {
+            players[player.id] = player;
+        });
+
+        socket.on('playerLeft', (id) => {
+            delete players[id];
+        });
+
+        socket.on('stateUpdate', (serverPlayers) => {
+            // Reconcile non-local players and smooth via authoritative step
+            for (let id in serverPlayers) {
+                if (!players[id]) {
+                    players[id] = serverPlayers[id];
+                } else {
+                    if (id !== myId) {
+                        // Interpolation target configuration
+                        players[id].x = serverPlayers[id].x;
+                        players[id].y = serverPlayers[id].y;
+                    } else {
+                        // Simple Client Reconciliation
+                        // Hard snapping fallback structural rule if position diverges too far
+                        const dist = Math.hypot(players[id].x - serverPlayers[id].x, players[id].y - serverPlayers[id].y);
+                        if (dist > 50) { 
+                            players[id].x = serverPlayers[id].x;
+                            players[id].y = serverPlayers[id].y;
+                        }
+                    }
+                    players[id].vx = serverPlayers[id].vx;
+                    players[id].vy = serverPlayers[id].vy;
+                    players[id].color = serverPlayers[id].color;
+                }
+            }
+        });
+
+        // Mobile Touch Processing Handles
+        window.addEventListener('touchstart', (e) => {
+            const touch = e.touches[0];
+            // Prevent virtual stick conflict if interaction happens on right quadrant
+            if (touch.clientX < window.innerWidth / 2) {
+                joystick.active = true;
+                joystick.startX = touch.clientX;
+                joystick.startY = touch.clientY;
+                joystick.currentX = touch.clientX;
+                joystick.currentY = touch.clientY;
+            }
+        });
+
+        window.addEventListener('touchmove', (e) => {
+            if (!joystick.active) return;
+            const touch = e.touches[0];
+            joystick.currentX = touch.clientX;
+            joystick.currentY = touch.clientY;
+
+            // Compute input payload
+            let vx = joystick.currentX - joystick.startX;
+            let vy = joystick.currentY - joystick.startY;
+            const dist = Math.hypot(vx, vy);
+
+            if (dist > joystick.maxRadius) {
+                vx = (vx / dist) * joystick.maxRadius;
+                vy = (vy / dist) * joystick.maxRadius;
+            }
+
+            // Fire input packet upstream to Server
+            socket.emit('move', { vx: vx / joystick.maxRadius, vy: vy / joystick.maxRadius });
+        });
+
+        window.addEventListener('touchend', () => {
+            if (!joystick.active) return;
+            joystick.active = false;
+            socket.emit('move', { vx: 0, vy: 0 });
+        });
+
+        // Keyboard Controls Fallback for Desktop Testing
+        const keys = { w: false, a: false, s: false, d: false };
+        function updateKeyboardMovement() {
+            if (joystick.active) return;
+            let vx = 0;
+            let vy = 0;
+            if (keys.w) vy = -1;
+            if (keys.s) vy = 1;
+            if (keys.a) vx = -1;
+            if (keys.d) vx = 1;
+            socket.emit('move', { vx, vy });
+        }
+        window.addEventListener('keydown', (e) => {
+            if (e.key in keys) { keys[e.key] = true; updateKeyboardMovement(); }
+        });
+        window.addEventListener('keyup', (e) => {
+            if (e.key in keys) { keys[e.key] = false; updateKeyboardMovement(); }
+        });
+
+        // Core 60 FPS Client-Side Render/Prediction Loop
+        let lastFrameTime = performance.now();
+
+        function gameLoop(now) {
+            const dt = (now - lastFrameTime) / 1000;
+            lastFrameTime = now;
+
+            // Clear Screen
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const me = players[myId];
+            if (!me) {
+                requestAnimationFrame(gameLoop);
+                return;
+            }
+
+            // Local Prediction update step logic ahead of server tick
+            if (joystick.active) {
+                let vx = joystick.currentX - joystick.startX;
+                let vy = joystick.currentY - joystick.startY;
+                const dist = Math.hypot(vx, vy);
+                if (dist > 0) {
+                    me.x += ((vx / dist) * localPlayerSpeed) * dt;
+                    me.y += ((vy / dist) * localPlayerSpeed) * dt;
+                }
+            } else {
+                let kvx = 0; let kvy = 0;
+                if (keys.w) kvy = -1; if (keys.s) kvy = 1;
+                if (keys.a) kvx = -1; if (keys.d) kvx = 1;
+                const kDist = Math.hypot(kvx, kvy);
+                if (kDist > 0) {
+                    me.x += ((kvx / kDist) * localPlayerSpeed) * dt;
+                    me.y += ((kvy / kDist) * localPlayerSpeed) * dt;
+                }
+            }
+
+            // Camera Transformation Offset positioning local user center stage
+            const camX = canvas.width / 2 - me.x;
+            const camY = canvas.height / 2 - me.y;
+
+            ctx.save();
+            ctx.translate(camX, camY);
+
+            // Draw Map Blueprint Grid Boundary lines
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 4;
+            for (let i = 0; i <= 2000; i += 100) {
+                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 2000); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(2000, i); ctx.stroke();
+            }
+
+            // Draw Active Multi-Players 2D Canvas space
+            for (let id in players) {
+                const p = players[id];
+                
+                // Draw Character Body
+                ctx.fillStyle = p.color || '#fff';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 20, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+
+                // Draw Visor (Amogus Style Aspect)
+                ctx.fillStyle = '#ADD8E6';
+                ctx.beginPath();
+                ctx.ellipse(p.x + 8, p.y - 4, 8, 5, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+            ctx.restore();
+
+            // Render Virtual Joystick Overlay Layer
+            if (joystick.active) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+                ctx.beginPath();
+                ctx.arc(joystick.startX, joystick.startY, joystick.maxRadius, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                ctx.beginPath();
+                ctx.arc(joystick.currentX, joystick.currentY, 25, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
